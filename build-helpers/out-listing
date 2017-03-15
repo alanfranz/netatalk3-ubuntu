@@ -1,0 +1,4 @@
+/usr/local/netatalk3
+/etc/pam.d/netatalk
+/etc/dbus-1/system.d/netatalk-dbus.conf
+/lib/systemd/system/netatalk.service

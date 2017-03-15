@@ -7,4 +7,5 @@
         --with-pam-confdir=/etc/pam.d \
         --with-dbus-daemon=/usr/bin/dbus-daemon \
         --with-dbus-sysconf-dir=/etc/dbus-1/system.d \
-        --with-tracker-pkgconfig-version=1.0
+        --with-tracker-pkgconfig-version=1.0 \
+	--prefix=/usr/local/netatalk3
