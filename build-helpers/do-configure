@@ -1,8 +1,12 @@
 ./configure \
         --with-init-style=debian-systemd \
+        --disable-mysql \
         --without-libevent \
         --without-tdb \
         --with-cracklib \
+	--with-cnid-tdb-backend=no \
+	--with-cnid-last-backend=no \
+	--without-mysql-config \
         --enable-krbV-uam \
         --with-pam-confdir=/etc/pam.d \
         --with-dbus-daemon=/usr/bin/dbus-daemon \
