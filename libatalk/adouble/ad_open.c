@@ -398,10 +398,10 @@ static int new_ad_header(struct adouble *ad, const char *path, struct stat *stp,
 /**
  * Read an AppleDouble buffer, returns 0 on success, -1 if an entry was malformatted
  **/
-static int parse_entries(struct adouble *ad, char *buf, uint16_t nentries)
+static int parse_entries(struct adouble *ad, uint16_t nentries, size_t valid_data_len)
 {
     uint32_t   eid, len, off;
-    int        ret = 0;
+    uint8_t *buf = ad->ad_data + AD_HEADER_LEN;
 
     /* now, read in the entry bits */
     for (; nentries > 0; nentries-- ) {
@@ -415,21 +415,21 @@ static int parse_entries(struct adouble *ad, char *buf, uint16_t nentries)
         len = ntohl( len );
         buf += sizeof( len );
 
-        ad->ad_eid[eid].ade_off = off;
-        ad->ad_eid[eid].ade_len = len;
-
         if (!eid
             || eid > ADEID_MAX
-            || off >= sizeof(ad->ad_data)
-            || ((eid != ADEID_RFORK) && (off + len >  sizeof(ad->ad_data))))
+            || off >= valid_data_len
+            || ((eid != ADEID_RFORK) && (off + len >  valid_data_len)))
         {
-            ret = -1;
             LOG(log_warning, logtype_ad, "parse_entries: bogus eid: %u, off: %u, len: %u",
                 (uint)eid, (uint)off, (uint)len);
+	    return -1;
         }
+        ad->ad_eid[eid].ade_off = off;
+        ad->ad_eid[eid].ade_len = len;
     }
 
-    return ret;
+    ad->valid_data_len = valid_data_len;
+    return 0;
 }
 
 /* this reads enough of the header so that we can figure out all of
@@ -443,7 +443,6 @@ static int ad_header_read(const char *path, struct adouble *ad, const struct sta
 {
     char                *buf = ad->ad_data;
     uint16_t            nentries;
-    int                 len;
     ssize_t             header_len;
     struct stat         st;
 
@@ -469,25 +468,19 @@ static int ad_header_read(const char *path, struct adouble *ad, const struct sta
 
     memcpy(&nentries, buf + ADEDOFF_NENTRIES, sizeof( nentries ));
     nentries = ntohs( nentries );
-
-    /* read in all the entry headers. if we have more than the
-     * maximum, just hope that the rfork is specified early on. */
-    len = nentries*AD_ENTRY_LEN;
-
-    if (len + AD_HEADER_LEN > sizeof(ad->ad_data))
-        len = sizeof(ad->ad_data) - AD_HEADER_LEN;
-
-    buf += AD_HEADER_LEN;
-    if (len > header_len - AD_HEADER_LEN) {
-        LOG(log_error, logtype_ad, "ad_header_read: can't read entry info.");
+    if (nentries > 16) {
+        LOG(log_error, logtype_ad, "ad_open: too many entries: %"PRIu16, nentries);
         errno = EIO;
         return -1;
     }
 
-    /* figure out all of the entry offsets and lengths. if we aren't
-     * able to read a resource fork entry, bail. */
-    nentries = len / AD_ENTRY_LEN;
-    if (parse_entries(ad, buf, nentries) != 0) {
+    if ((nentries * AD_ENTRY_LEN) + AD_HEADER_LEN > header_len) {
+        LOG(log_error, logtype_ad, "ad_header_read: too many entries: %zd", header_len);
+        errno = EIO;
+        return -1;
+    }
+
+    if (parse_entries(ad, nentries, header_len) != 0) {
         LOG(log_warning, logtype_ad, "ad_header_read(%s): malformed AppleDouble",
             path ? fullpathname(path) : "");
         errno = EIO;
@@ -649,7 +642,6 @@ static int ad_header_read_osx(const char *path, struct adouble *ad, const struct
     struct adouble      adosx;
     char                *buf;
     uint16_t            nentries;
-    int                 len;
     ssize_t             header_len;
     struct stat         st;
     int                 retry_read = 0;
@@ -682,22 +674,23 @@ reread:
 
     memcpy(&nentries, buf + ADEDOFF_NENTRIES, sizeof( nentries ));
     nentries = ntohs(nentries);
-    len = nentries * AD_ENTRY_LEN;
-
-    if (len + AD_HEADER_LEN > sizeof(adosx.ad_data))
-        len = sizeof(adosx.ad_data) - AD_HEADER_LEN;
-
-    buf += AD_HEADER_LEN;
-    if (len > header_len - AD_HEADER_LEN) {
-        LOG(log_error, logtype_ad, "ad_header_read_osx: can't read entry info.");
+    if (nentries > 16) {
+        LOG(log_error, logtype_ad, "ad_header_read_osx: too many entries: %"PRIu16, nentries);
         errno = EIO;
         return -1;
     }
 
-    nentries = len / AD_ENTRY_LEN;
-    if (parse_entries(&adosx, buf, nentries) != 0) {
+    if ((nentries * AD_ENTRY_LEN) + AD_HEADER_LEN > header_len) {
+        LOG(log_error, logtype_ad, "ad_header_read_osx: too many entries: %zd", header_len);
+        errno = EIO;
+        return -1;
+    }
+
+    if (parse_entries(&adosx, nentries, header_len) != 0) {
         LOG(log_warning, logtype_ad, "ad_header_read(%s): malformed AppleDouble",
             path ? fullpathname(path) : "");
+            errno = EIO;
+            EC_FAIL;
     }
 
     if (ad_getentrylen(&adosx, ADEID_FINDERI) != ADEDLEN_FINDERI) {
@@ -782,7 +775,7 @@ static int ad_header_read_ea(const char *path, struct adouble *ad, const struct 
     }
 
     /* Now parse entries */
-    if (parse_entries(ad, buf + AD_HEADER_LEN, nentries)) {
+    if (parse_entries(ad, nentries, header_len)) {
         LOG(log_warning, logtype_ad, "ad_header_read(%s): malformed AppleDouble",
             path ? fullpathname(path) : "");
         errno = EINVAL;
@@ -1539,6 +1532,122 @@ static int ad_open_rf(const char *path, int adflags, int mode, struct adouble *a
 /***********************************************************************************
  * API functions
  ********************************************************************************* */
+
+/*
+ * All entries besides FinderInfo and resource fork must fit into the
+ * buffer. FinderInfo is special as it may be larger then the default 32 bytes
+ * if it contains marshalled xattrs, which we will fixup that in
+ * ad_convert(). The first 32 bytes however must also be part of the buffer.
+ *
+ * The resource fork is never accessed directly by the ad_data buf.
+ */
+static bool ad_entry_check_size(uint32_t eid,
+				size_t bufsize,
+				uint32_t off,
+				uint32_t got_len)
+{
+	struct {
+		off_t expected_len;
+		bool fixed_size;
+		bool minimum_size;
+	} ad_checks[] = {
+		[ADEID_DFORK] = {-1, false, false}, /* not applicable */
+		[ADEID_RFORK] = {-1, false, false}, /* no limit */
+		[ADEID_NAME] = {ADEDLEN_NAME, false, false},
+		[ADEID_COMMENT] = {ADEDLEN_COMMENT, false, false},
+		[ADEID_ICONBW] = {ADEDLEN_ICONBW, true, false},
+		[ADEID_ICONCOL] = {ADEDLEN_ICONCOL, false, false},
+		[ADEID_FILEI] = {ADEDLEN_FILEI, true, false},
+		[ADEID_FILEDATESI] = {ADEDLEN_FILEDATESI, true, false},
+		[ADEID_FINDERI] = {ADEDLEN_FINDERI, false, true},
+		[ADEID_MACFILEI] = {ADEDLEN_MACFILEI, true, false},
+		[ADEID_PRODOSFILEI] = {ADEDLEN_PRODOSFILEI, true, false},
+		[ADEID_MSDOSFILEI] = {ADEDLEN_MSDOSFILEI, true, false},
+		[ADEID_SHORTNAME] = {ADEDLEN_SHORTNAME, false, false},
+		[ADEID_AFPFILEI] = {ADEDLEN_AFPFILEI, true, false},
+		[ADEID_DID] = {ADEDLEN_DID, true, false},
+		[ADEID_PRIVDEV] = {ADEDLEN_PRIVDEV, true, false},
+		[ADEID_PRIVINO] = {ADEDLEN_PRIVINO, true, false},
+		[ADEID_PRIVSYN] = {ADEDLEN_PRIVSYN, true, false},
+		[ADEID_PRIVID] = {ADEDLEN_PRIVID, true, false},
+	};
+    uint32_t required_len;
+
+	if (eid >= ADEID_MAX) {
+		return false;
+	}
+	if (got_len == 0) {
+		/* Entry present, but empty, allow */
+		return true;
+	}
+	if (ad_checks[eid].expected_len == 0) {
+		/*
+		 * Shouldn't happen: implicitly initialized to zero because
+		 * explicit initializer missing.
+		 */
+		return false;
+	}
+	if (ad_checks[eid].expected_len == -1) {
+		/* Unused or no limit */
+		return true;
+	}
+	if (ad_checks[eid].fixed_size) {
+		if (ad_checks[eid].expected_len != got_len) {
+			/* Wrong size fo fixed size entry. */
+			return false;
+		}
+        required_len = got_len;
+	} else {
+		if (ad_checks[eid].minimum_size) {
+			if (got_len < ad_checks[eid].expected_len) {
+				/*
+				 * Too small for variable sized entry with
+				 * minimum size.
+				 */
+				return false;
+			}
+        required_len = got_len;
+		} else {
+			if (got_len > ad_checks[eid].expected_len) {
+				/* Too big for variable sized entry. */
+				return false;
+			}
+            /*
+             * Expect the buffer to provide enough room for the maximum possible
+             * size.
+             */
+            required_len = ad_checks[eid].expected_len;
+		}
+	}
+	if (off + required_len < off) {
+		/* wrap around */
+		return false;
+	}
+	if (off + required_len > bufsize) {
+		/* overflow */
+		return false;
+	}
+	return true;
+}
+
+void *ad_entry(const struct adouble *ad, int eid)
+{
+	size_t bufsize = ad->valid_data_len;
+	off_t off = ad_getentryoff(ad, eid);
+	size_t len = ad_getentrylen(ad, eid);
+	bool valid;
+
+	valid = ad_entry_check_size(eid, bufsize, off, len);
+	if (!valid) {
+		return NULL;
+	}
+
+	if (off == 0 || len == 0) {
+		return NULL;
+	}
+
+	return ((struct adouble *)ad)->ad_data + off;
+}
 
 off_t ad_getentryoff(const struct adouble *ad, int eid)
 {
